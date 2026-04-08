@@ -72,6 +72,50 @@ uv run demo/collect.py
 uv run demo/offline_rd_ra.py --h5-file radarpackets_name.h5 --rsp AWR1642Boost --sample-every 20 --max-outputs 10
 ```
 
+## Detailed CLI Commands
+
+### 1) Live demo with physical axes (`demo/demo_units.py`)
+
+Use AWR1843L default config:
+
+```sh
+uv run demo/demo_units.py --config demo/config_awr1843l.yaml
+```
+
+Explicit device/RSP override:
+
+```sh
+uv run demo/demo_units.py --config demo/config_awr1843l.yaml --device AWR1843L --rsp AWR1642Boost --verbose 20
+```
+
+### 2) Raw packet capture to HDF5 (`demo/collect.py`)
+
+Capture with default output path (`data/YYYY.MM.DD-HH.MM.SS.h5`):
+
+```sh
+uv run demo/collect.py --config demo/config_awr1843l.yaml
+```
+
+Capture with explicit output file and packet limit:
+
+```sh
+uv run demo/collect.py --config demo/config_awr1843l.yaml --output /home/nvidia/xwr/data/radarpackets_1843l.h5 --max-packets 50000 --flush-every 1024 --verbose 20
+```
+
+### 3) Offline RD/RA rendering from HDF5 (`demo/offline_rd_ra.py`)
+
+Use latest H5 automatically:
+
+```sh
+uv run demo/offline_rd_ra.py --config demo/config_awr1843l.yaml --rsp AWR1642Boost --sample-every 20 --max-outputs 10
+```
+
+Use a specific H5 and output folder:
+
+```sh
+uv run demo/offline_rd_ra.py --config demo/config_awr1843l.yaml --h5-file /home/nvidia/xwr/data/2026.04.08-14.10.56.h5 --rsp AWR1642Boost --out-dir /home/nvidia/xwr/data/offline_rdra_out --sample-every 10 --max-outputs 30
+```
+
 ## Calibration via Config (No API Hardcoding)
 
 This fork supports passing radar calibration through the radar config file, instead of hardcoding calibration values in `xwr/radar/api.py`.
