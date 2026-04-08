@@ -5,6 +5,10 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
+
 [project]
 name = "xwr"
 version = "0.4.1"
@@ -35,6 +39,7 @@ dependencies = [
     "tyro",
     "pyyaml",
     "matplotlib",
+    "h5py",
     "rich",
 ]
 

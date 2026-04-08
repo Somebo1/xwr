@@ -105,7 +105,6 @@ def get_boilerplate() -> str:
         "cqNumSlices": 121, "rxChanMask": 0,
         "sigImgNumSlices": 127, "numSamplePerSlice": 4,
         "rxSaturation": 0, "sigImgBand": 0,
-        "save_enable": 0, "restore_enable": 0, "flash_offset": 0,
     }
     return (
         '# Disabled to minimize chances of interference.\n'
@@ -132,8 +131,7 @@ def get_boilerplate() -> str:
         f'CQRxSatMonitor {a["profile"]} {a["satMonSel"]} {a["priSliceDuration"]}'
         f' {a["cqNumSlices"]} {a["rxChanMask"]}\n'
         f'CQSigImgMonitor {a["profile"]} {a["sigImgNumSlices"]} {a["numSamplePerSlice"]}\n'
-        f'analogMonitor {a["rxSaturation"]} {a["sigImgBand"]}\n'
-        f'calibData {a["save_enable"]} {a["restore_enable"]} {a["flash_offset"]}'
+        f'analogMonitor {a["rxSaturation"]} {a["sigImgBand"]}'
     )
 
 
@@ -223,7 +221,7 @@ class APIMixins:
 
     def compRangeBiasAndRxChanPhase(
         self, rangeBias: float = 0.0,
-        rx_phase: list[tuple[int, int]] = [(0, 1)] * 12
+        rx_phase: list[tuple[float, float]] = [(1.0, 0.0)] * 12
     ) -> None:
         """Set range bias, channel phase compensation.
 

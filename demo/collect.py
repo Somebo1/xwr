@@ -7,20 +7,18 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 import tyro
 import yaml
 from rich.logging import RichHandler
 
 import xwr
+from xwr.capture import types as capture_types
+
+PACKET_WORDS = 728
+PACKET_BYTES = PACKET_WORDS * 2
 
 
 def _default_output_path() -> str:
-    """Return the default HDF5 output path under `<repo>/data/`.
-
-    The filename uses local wall-clock time with second precision, e.g.
-    `2026.04.08-14.32.10.h5`.
-    """
     root = Path(__file__).resolve().parents[1]
     data_dir = root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -29,16 +27,6 @@ def _default_output_path() -> str:
 
 
 def _resolve_output_path(output: str | None) -> str:
-    """Resolve and prepare the final output path for captured packets.
-
-    Args:
-        output: User-provided path. If `None`, a timestamped default path is
-            generated under `<repo>/data/`.
-
-    Returns:
-        Absolute or relative-resolved path where the HDF5 file should be
-        written. Parent directory is created if needed.
-    """
     if output is None:
         return _default_output_path()
     path = Path(output)
@@ -51,6 +39,77 @@ def _resolve_output_path(output: str | None) -> str:
     return str(data_dir / path)
 
 
+def _import_h5py():
+    import importlib
+
+    try:
+        return importlib.import_module("h5py")
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Missing dependency 'h5py'. Install project dependencies with uv sync."
+        ) from e
+
+
+def _packet_dtype() -> np.dtype:
+    dtype = np.dtype(
+        [
+            ("t", np.float64),
+            ("packet_num", np.uint32),
+            ("byte_count", np.uint64),
+            ("packet_data", np.uint16, (PACKET_WORDS,)),
+        ]
+    )
+    expected = ("t", "packet_num", "byte_count", "packet_data")
+    actual = tuple(dtype.names or ())
+    if actual != expected:
+        raise ValueError(f"Unexpected packet fields: {actual} != {expected}")
+    return dtype
+
+
+def _payload_to_words(system: xwr.XWRSystem, payload: bytes | bytearray) -> np.ndarray:
+    convert = getattr(system.dca, "payload_to_words", None)
+    if callable(convert):
+        return convert(payload)
+    words = np.frombuffer(payload, dtype="<u2", count=len(payload) // 2)
+    return words.astype(np.uint16, copy=False)
+
+
+def _iter_packets(system: xwr.XWRSystem):
+    recv = getattr(system.dca, "_recv", None)
+    if callable(recv):
+        while True:
+            packet = recv()
+            if packet is None:
+                break
+            yield packet
+        return
+
+    data_socket = getattr(system.dca, "data_socket", None)
+    timeout = float(getattr(system.dca, "timeout", 1.0))
+    max_packet = int(getattr(system.dca, "_MAX_PACKET_SIZE", 2048))
+    if data_socket is None:
+        raise AttributeError("DCA1000EVM does not expose a usable packet receive API.")
+
+    deadline = time.perf_counter() + timeout
+    while True:
+        try:
+            raw, _ = data_socket.recvfrom(max_packet)
+            deadline = time.perf_counter() + timeout
+            yield capture_types.DataPacket.from_bytes(raw)
+        except BlockingIOError:
+            if time.perf_counter() > deadline:
+                break
+
+
+def _prepare_capture(system: xwr.XWRSystem) -> None:
+    system.dca.stop()
+    system.dca.reset_ar_device()
+    system.dca.flush()
+    system.dca.start()
+    system.xwr.setup(**system.config.as_dict())
+    system.xwr.start()
+
+
 def _collect_packets_h5(
     system: xwr.XWRSystem,
     output_path: str,
@@ -59,99 +118,70 @@ def _collect_packets_h5(
     flush_every: int,
     log: logging.Logger,
 ) -> tuple[str, int, float]:
-    """Capture raw DCA packets and persist them into an HDF5 dataset.
+    h5py = _import_h5py()
+    dtype = _packet_dtype()
 
-    Packet stream is written to `/scan/packet` with a structured dtype:
-    `(t, packet_num, byte_count, packet_data)`.
-
-    Args:
-        system: Initialized radar system object.
-        output_path: Destination HDF5 file path.
-        max_packets: Optional hard stop for total packet count.
-        flush_every: Number of buffered packets before flushing to disk.
-        log: Logger used for periodic progress reporting.
-
-    Returns:
-        Tuple of `(output_path, total_packets, duration_seconds)`.
-    """
-    import importlib
-
-    h5py = importlib.import_module("h5py")
-    dtype = np.dtype(
-        [
-            ("t", np.float64),
-            ("packet_num", np.uint32),
-            ("byte_count", np.uint64),
-            ("packet_data", np.uint16, (728,)),
-        ]
-    )
-
-    expected = ("t", "packet_num", "byte_count", "packet_data")
-    actual = tuple(dtype.names or ())
-    if actual != expected:
-        raise ValueError(f"Unexpected packet fields: {actual} != {expected}")
-
-    system.dca.stop()
-    system.dca.reset_ar_device()
-    system.dca.flush()
-    system.dca.start()
-    system.xwr.setup(**system.config.as_dict())
-    system.xwr.start()
-
+    _prepare_capture(system)
     start = time.time()
-    f = h5py.File(output_path, "w")
-    scan = f.create_group("scan")
-    dset = scan.create_dataset(
-        "packet", shape=(0,), maxshape=(None,), dtype=dtype, chunks=True
-    )
-    buf = np.empty((max(1, flush_every),), dtype=dtype)
-    buf_i = 0
     total = 0
     last_log_count = 0
     last_log_t = start
 
-    def flush() -> None:
-        nonlocal buf_i
-        if buf_i <= 0:
-            return
-        begin = dset.shape[0]
-        dset.resize((begin + buf_i,))
-        dset[begin : begin + buf_i] = buf[:buf_i]
-        f.flush()
+    with h5py.File(output_path, "w") as f:
+        scan = f.create_group("scan")
+        dset = scan.create_dataset(
+            "packet", shape=(0,), maxshape=(None,), dtype=dtype, chunks=True
+        )
+        buf = np.empty((max(1, flush_every),), dtype=dtype)
         buf_i = 0
 
-    try:
-        for packet in system.dca.packets():
-            buf[buf_i]["t"] = time.time()
-            buf[buf_i]["packet_num"] = np.uint32(packet.sequence_number)
-            buf[buf_i]["byte_count"] = np.uint64(packet.byte_count)
-            buf[buf_i]["packet_data"] = system.dca.payload_to_words(packet.data)
-            buf_i += 1
-            total += 1
+        def flush() -> None:
+            nonlocal buf_i
+            if buf_i <= 0:
+                return
+            begin = dset.shape[0]
+            dset.resize((begin + buf_i,))
+            dset[begin : begin + buf_i] = buf[:buf_i]
+            f.flush()
+            buf_i = 0
 
-            if buf_i >= buf.shape[0]:
-                flush()
-            if max_packets is not None and total >= max_packets:
-                break
+        try:
+            for packet in _iter_packets(system):
+                words = _payload_to_words(system, packet.data)
+                if words.shape[0] != PACKET_WORDS:
+                    fixed = np.zeros((PACKET_WORDS,), dtype=np.uint16)
+                    n = min(PACKET_WORDS, int(words.shape[0]))
+                    fixed[:n] = words[:n]
+                    words = fixed
 
-            now = time.time()
-            if now - last_log_t >= 5.0:
-                dt = now - last_log_t
-                delta = total - last_log_count
-                pps = delta / dt if dt > 0 else 0.0
-                mbps = pps * 1456 * 8 / 1e6
-                log.info(
-                    f"Captured {total} packets | rate={pps:.1f} pkt/s "
-                    f"({mbps:.2f} Mbps)"
-                )
-                last_log_t = now
-                last_log_count = total
-    except KeyboardInterrupt:
-        log.warning("KeyboardInterrupt received, stopping capture.")
-    finally:
-        flush()
-        f.close()
-        system.stop()
+                buf[buf_i]["t"] = time.time()
+                buf[buf_i]["packet_num"] = np.uint32(packet.sequence_number)
+                buf[buf_i]["byte_count"] = np.uint64(packet.byte_count)
+                buf[buf_i]["packet_data"] = words
+                buf_i += 1
+                total += 1
+
+                if buf_i >= buf.shape[0]:
+                    flush()
+                if max_packets is not None and total >= max_packets:
+                    break
+
+                now = time.time()
+                if now - last_log_t >= 5.0:
+                    dt = now - last_log_t
+                    delta = total - last_log_count
+                    pps = delta / dt if dt > 0 else 0.0
+                    mbps = pps * PACKET_BYTES * 8 / 1e6
+                    log.info(
+                        f"Captured {total} packets | rate={pps:.1f} pkt/s ({mbps:.2f} Mbps)"
+                    )
+                    last_log_t = now
+                    last_log_count = total
+        except KeyboardInterrupt:
+            log.warning("KeyboardInterrupt received, stopping capture.")
+        finally:
+            flush()
+            system.stop()
 
     duration = max(0.0, time.time() - start)
     return output_path, total, duration
@@ -165,20 +195,6 @@ def cli_main(
     flush_every: int = 1024,
     verbose: int = 20,
 ) -> None:
-    """Raw packet capture demo that writes DCA stream to an HDF5 file.
-
-    If `config` is not provided, defaults to `demo/config.yaml`. You can set
-    `device` to override the radar device in configuration.
-
-    Args:
-        config: Path to radar configuration YAML.
-        device: Optional radar device override (e.g. `AWR1843`).
-        output: Output HDF5 path. If omitted, auto-saves to `<repo>/data/`.
-        max_packets: Optional packet limit; `None` means capture until manual
-            interruption.
-        flush_every: Number of packets buffered before writing to disk.
-        verbose: Logging verbosity (10-debug, 20-info, 30-warning, 40-error).
-    """
     logging.basicConfig(
         level=verbose,
         format="%(name)-12s  %(message)s",
@@ -199,11 +215,9 @@ def cli_main(
     log.info(f"Output path: {out_path}")
     log.info(
         "H5 schema: /scan/packet fields "
-        "[t(float64), packet_num(uint32), byte_count(uint64), packet_data(uint16[728])]"
+        f"[t(float64), packet_num(uint32), byte_count(uint64), packet_data(uint16[{PACKET_WORDS}])]"
     )
-    log.info(
-        f"Capture mode: max_packets={max_packets}, flush_every={flush_every}"
-    )
+    log.info(f"Capture mode: max_packets={max_packets}, flush_every={flush_every}")
 
     awr = xwr.XWRSystem(**cfg)
     path, total_packets, duration = _collect_packets_h5(
@@ -213,8 +227,9 @@ def cli_main(
         flush_every=flush_every,
         log=log,
     )
+
     avg_pps = total_packets / duration if duration > 0 else 0.0
-    avg_mbps = avg_pps * 1456 * 8 / 1e6
+    avg_mbps = avg_pps * PACKET_BYTES * 8 / 1e6
     log.info(f"Total capture time: {duration:.3f}s")
     log.info(f"Total packets captured: {total_packets}")
     log.info(f"Average capture rate: {avg_pps:.1f} pkt/s ({avg_mbps:.2f} Mbps)")
