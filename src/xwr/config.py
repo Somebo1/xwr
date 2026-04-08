@@ -1,6 +1,7 @@
 """High level radar capture system API."""
 
 from dataclasses import dataclass
+from typing import Any
 
 from . import radar
 from .capture import DCA1000EVM, defines
@@ -46,6 +47,7 @@ class XWRConfig:
     frame_length: int
     frame_period: float
     port: str | None = None
+    calibration: dict[str, Any] | str | None = None
 
     @property
     def device_type(self) -> type[radar.XWRBase]:
@@ -140,12 +142,12 @@ class XWRConfig:
         """Average throughput, in bits/sec."""
         return self.frame_size * 8 / self.frame_period * 1e3
 
-    def as_dict(self) -> dict[str, float | int]:
+    def as_dict(self) -> dict[str, float | int | dict[str, Any] | str | None]:
         """Export as dictionary."""
         RADAR_PROPERTIES = [
             "frequency", "idle_time", "adc_start_time", "ramp_end_time",
             "tx_start_time", "freq_slope", "adc_samples", "sample_rate",
-            "frame_length", "frame_period"]
+            "frame_length", "frame_period", "calibration"]
         return {k: getattr(self, k) for k in RADAR_PROPERTIES}
 
     def as_intrinsics(self) -> dict:

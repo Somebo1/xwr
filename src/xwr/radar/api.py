@@ -1,10 +1,81 @@
 """Radar sensor APIs."""
 
+from typing import Any
+
 from . import common, defines
 from .base import XWRBase
 
 # NOTE: We ignore a few naming rules to maintain consistency with TI's naming.
 # ruff: noqa: N802, N803
+
+
+def _parse_compensation_tokens(
+    tokens: list[str],
+    expected_pairs: int,
+) -> tuple[float, list[tuple[float, float]]]:
+    if len(tokens) < 1 + expected_pairs * 2:
+        raise ValueError(
+            "Not enough calibration values, expected "
+            f"{1 + expected_pairs * 2}, got {len(tokens)}")
+    vals = [float(v) for v in tokens]
+    range_bias = vals[0]
+    rx_vals = vals[1:1 + expected_pairs * 2]
+    rx_comp = [
+        (rx_vals[i], rx_vals[i + 1])
+        for i in range(0, len(rx_vals), 2)
+    ]
+    return range_bias, rx_comp
+
+
+def _resolve_compensation(
+    calibration: dict[str, Any] | str | None,
+    expected_pairs: int,
+) -> tuple[float, list[tuple[float, float]]]:
+    identity = (1.0, 0.0)
+    default = (0.0, [identity] * expected_pairs)
+    if calibration is None:
+        return default
+
+    if isinstance(calibration, str):
+        raw = calibration.strip()
+        if not raw:
+            return default
+        parts = raw.split()
+        if parts[0] == "compRangeBiasAndRxChanPhase":
+            parts = parts[1:]
+        return _parse_compensation_tokens(parts, expected_pairs)
+
+    cmd = calibration.get("comp_range_bias_and_rx_chan_phase")
+    if isinstance(cmd, str) and cmd.strip():
+        parts = cmd.strip().split()
+        if parts[0] == "compRangeBiasAndRxChanPhase":
+            parts = parts[1:]
+        return _parse_compensation_tokens(parts, expected_pairs)
+
+    range_bias = float(calibration.get("range_bias", 0.0))
+    rx_comp_cfg = calibration.get("rx_comp")
+    if rx_comp_cfg is None:
+        rx_comp_cfg = calibration.get("rx_coeffs")
+    if rx_comp_cfg is None:
+        rx_comp_cfg = calibration.get("rx_phase")
+    if rx_comp_cfg is None:
+        return (range_bias, [identity] * expected_pairs)
+
+    rx_comp: list[tuple[float, float]] = []
+    for pair in rx_comp_cfg:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                "Each rx_comp item must be a [real, imag] pair.")
+        rx_comp.append((
+            float(pair[0]),
+            float(pair[1]),
+        ))
+
+    if len(rx_comp) != expected_pairs:
+        raise ValueError(
+            "rx_comp length mismatch, expected "
+            f"{expected_pairs}, got {len(rx_comp)}")
+    return range_bias, rx_comp
 
 
 class AWR1843(XWRBase, common.APIMixins):
@@ -40,7 +111,8 @@ class AWR1843(XWRBase, common.APIMixins):
         adc_start_time: float = 4.0, ramp_end_time: float = 56.0,
         tx_start_time: float = 1.0, freq_slope: float = 70.006,
         adc_samples: int = 256, sample_rate: int = 5000,
-        frame_length: int = 64, frame_period: float = 100.0
+        frame_length: int = 64, frame_period: float = 100.0,
+        calibration: dict[str, Any] | str | None = None,
     ) -> None:
         """Configure radar.
 
@@ -73,7 +145,8 @@ class AWR1843(XWRBase, common.APIMixins):
         self.frameCfg(
             numLoops=frame_length, chirpEndIdx=self.NUM_TX - 1,
             framePeriodicity=frame_period)
-        self.compRangeBiasAndRxChanPhase(rx_phase = [(0, 1)] * 4 * 3)
+        range_bias, rx_comp = _resolve_compensation(calibration, expected_pairs=12)
+        self.compRangeBiasAndRxChanPhase(rangeBias=range_bias, rx_phase=rx_comp)
         self.lvdsStreamCfg()
 
         self.send("lowPower 0 0")
@@ -136,7 +209,8 @@ class AWR1642(XWRBase, common.APIMixins):
         adc_start_time: float = 4.0, ramp_end_time: float = 56.0,
         tx_start_time: float = 1.0, freq_slope: float = 70.006,
         adc_samples: int = 256, sample_rate: int = 5000,
-        frame_length: int = 64, frame_period: float = 100.0
+        frame_length: int = 64, frame_period: float = 100.0,
+        calibration: dict[str, Any] | str | None = None,
     ) -> None:
         """Configure radar.
 
@@ -169,7 +243,8 @@ class AWR1642(XWRBase, common.APIMixins):
         self.frameCfg(
             numLoops=frame_length, chirpEndIdx=self.NUM_TX - 1,
             framePeriodicity=frame_period)
-        self.compRangeBiasAndRxChanPhase(rx_phase = [(0, 1)] * 4 * 2)
+        range_bias, rx_comp = _resolve_compensation(calibration, expected_pairs=8)
+        self.compRangeBiasAndRxChanPhase(rangeBias=range_bias, rx_phase=rx_comp)
         self.send("bpmCfg -1 0 0 1")
         self.lvdsStreamCfg()
 
@@ -213,7 +288,8 @@ class AWR2944(XWRBase, common.APIMixins):
         adc_start_time: float = 4.0, ramp_end_time: float = 56.0,
         tx_start_time: float = 1.0, freq_slope: float = 70.006,
         adc_samples: int = 256, sample_rate: int = 5000,
-        frame_length: int = 64, frame_period: float = 100.0
+        frame_length: int = 64, frame_period: float = 100.0,
+        calibration: dict[str, Any] | str | None = None,
     ) -> None:
         """Configure radar.
 
@@ -258,7 +334,8 @@ class AWR2944(XWRBase, common.APIMixins):
             triggerSelect=1, frameTriggerDelay=0.0))
 
         self.send(common.configure_channels(rx=self._RX_MASK, tx=self._TX_MASK))
-        self.compRangeBiasAndRxChanPhase(rx_phase = [(1, 0)] * 4 * 4)
+        range_bias, rx_comp = _resolve_compensation(calibration, expected_pairs=16)
+        self.compRangeBiasAndRxChanPhase(rangeBias=range_bias, rx_phase=rx_comp)
         self.lvdsStreamCfg()
 
         # Can't be bothered to figure out what this does
