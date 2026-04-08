@@ -43,3 +43,31 @@ pip install git+ssh://github.com/RadarML/xwr.git
 
 > [!WARNING]
 > `xwr` does not include a copy of `torch` or `jax` by default! You must specify your own dependency and/or use the `xwr[torch]` and `xwr[jax]` extras if you intend to use these backends for the radar signal processing (`xwr.rsp`) submodule.
+
+## Setup Policy for This Fork
+
+Please follow the official `xwr` documentation for hardware deployment and software configuration without deviation:
+
+- [xwr documentation](https://radarml.github.io/xwr/)
+- [Hardware and environment setup](https://radarml.github.io/xwr/setup/)
+
+This fork is designed to stay compatible with the upstream setup workflow. The additional scripts below are intended to be used after completing the official installation and device bring-up steps.
+
+## Additions in This Fork
+
+On top of the original `xwr` project, this fork adds the following utilities:
+
+1. `demo/collect.py`: raw packet capture to `radarpackets.h5` format for DART integration.
+   - Default config is `demo/config_awr1843l.yaml`.
+   - Radar profile is configured as **2 TX / 4 RX** to align with the DART pipeline.
+2. `demo/offline_rd_ra.py`: offline data inspection after collection.
+   - Input: captured raw packet HDF5 file.
+   - Output: sampled-frame Range-Doppler (RD) and Range-Azimuth (RA) visualizations.
+3. `demo/demo_units.py`: enhanced live demo with physical unit labels for faster operational checks and status interpretation.
+
+## CLI Quick Start
+
+```sh
+uv run demo/collect.py
+uv run demo/offline_rd_ra.py --h5-file radarpackets_name.h5 --rsp AWR1642Boost --sample-every 20 --max-outputs 10
+```

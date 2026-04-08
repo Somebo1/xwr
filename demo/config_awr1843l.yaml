@@ -1,0 +1,26 @@
+
+# Rmax = 5.04m
+# Vmax = ±1.25m/s
+# B_total = 3.954 GHz
+
+
+radar:
+    device: AWR1843L
+    port: null
+    frequency: 77.0
+    idle_time: 331.0
+    adc_start_time: 5.7
+    ramp_end_time: 59.00
+    tx_start_time: 1.0
+    freq_slope: 67.012
+    adc_samples: 128
+    sample_rate: 2500
+    frame_length: 128
+    frame_period: 100.0
+    calibration:
+        comp_range_bias_and_rx_chan_phase: "compRangeBiasAndRxChanPhase -0.0071049 -0.34449 -0.74618 -0.23290 -0.97250 -0.23366 -0.87015 -0.33699 -0.78156 -0.22025 -0.77553 -0.18965 -0.85011 -0.17263 -0.82861 -0.16805 -0.79882 -0.17939 -0.63912 -0.03873 -0.77678 -0.14587 -0.70194 -0.19648 -0.63314"
+
+capture:
+    sys_ip: 192.168.33.30
+    fpga_ip: 192.168.33.180
+    socket_buffer: 6291456
