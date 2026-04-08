@@ -32,6 +32,10 @@ dependencies = [
     "types-pyserial >= 3.5",
     "jaxtyping >= 0.3.2",
     "pyFFTW >= 0.15.0"
+    "tyro",
+    "pyyaml",
+    "matplotlib",
+    "rich",
 ]
 
 [project.optional-dependencies]
