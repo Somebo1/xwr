@@ -1,5 +1,7 @@
 """Offline R-D and R-A plotting from packet HDF5."""
 
+"""其功能是快速检查采集的数据是否正常"""
+
 from pathlib import Path
 
 import importlib
