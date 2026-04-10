@@ -20,7 +20,7 @@ from rich.progress import (
 )
 
 import xwr
-from xwr.rsp import numpy as xwr_rsp
+from xwr.rsp import iq_from_iiqq, numpy as xwr_rsp
 
 C0 = 299_792_458.0
 
@@ -56,6 +56,15 @@ def _import_h5py():
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
             "Missing dependency 'h5py'. Install project dependencies with uv sync."
+        ) from e
+
+
+def _import_jax():
+    try:
+        return importlib.import_module("jax")
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Missing dependency 'jax'. Install with `uv sync --extra jax`."
         ) from e
 
 
@@ -213,6 +222,9 @@ def cli_main(
     max_frames: int | None = None,
     azimuth_bins: int = 8,
     apply_window: bool = True,
+    backend: str = "numpy",
+    jax_device: str = "auto",
+    jax_jit: bool = True,
 ) -> None:
     if config is None:
         config = os.path.join(os.path.dirname(__file__), "config_awr1843l.yaml")
@@ -221,10 +233,72 @@ def cli_main(
 
     radar_cfg = xwr.XWRConfig(**cfg["radar"])
     raw_shape = radar_cfg.raw_shape
-    rsp_inst = getattr(xwr_rsp, rsp)(
+    backend_name = backend.strip().lower()
+    if backend_name not in {"numpy", "jax"}:
+        raise ValueError(f"Unsupported backend: {backend}. Choose one of: numpy, jax")
+
+    jax = None
+    jnp = None
+    jax_compute_device = None
+    if backend_name == "jax":
+        jax = _import_jax()
+        jnp = importlib.import_module("jax.numpy")
+        if jax_device != "auto":
+            candidate_devices = jax.devices(jax_device)
+            if not candidate_devices:
+                raise RuntimeError(
+                    f"No JAX device found for platform '{jax_device}'. "
+                    f"Available: {[d.platform for d in jax.devices()]}"
+                )
+            jax_compute_device = candidate_devices[0]
+
+    rsp_module = xwr_rsp if backend_name == "numpy" else importlib.import_module("xwr.rsp.jax")
+    rsp_inst = getattr(rsp_module, rsp)(
         window=bool(apply_window), size={"azimuth": max(1, int(azimuth_bins))}
     )
     num_tx = _infer_num_tx(rsp_inst, default=radar_cfg.num_tx)
+
+    if backend_name == "numpy":
+        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, int]:
+            frame_batch: np.ndarray = frame[None, ...]
+            if rsp_inst.SAMPLE_TYPE == "IQ":
+                frame_for_rsp = iq_from_iiqq(frame_batch).astype(np.complex64, copy=False)
+            else:
+                frame_for_rsp = frame_batch.astype(np.float32, copy=False)
+
+            rd = rsp_inst.doppler_range(frame_for_rsp)
+            dear = np.abs(rsp_inst.elevation_azimuth(rd))[0]
+            rda = np.transpose(np.mean(dear, axis=1), (2, 0, 1)).astype(np.float16)
+            doppler_power = np.mean(rda.astype(np.float32), axis=(0, 2))
+            speed_idx = int(np.argmax(doppler_power))
+            return rda, speed_idx
+    else:
+        assert jax is not None
+        assert jnp is not None
+
+        def _process_frame_jax(frame_batch):
+            if rsp_inst.SAMPLE_TYPE == "IQ":
+                frame_for_rsp = iq_from_iiqq(frame_batch)
+            else:
+                frame_for_rsp = frame_batch.astype(jnp.float32)
+
+            rd = rsp_inst.doppler_range(frame_for_rsp)
+            dear = jnp.abs(rsp_inst.elevation_azimuth(rd))[0]
+            rda_fp32 = jnp.transpose(jnp.mean(dear, axis=1), (2, 0, 1))
+            doppler_power = jnp.mean(rda_fp32, axis=(0, 2))
+            return rda_fp32.astype(jnp.float16), jnp.argmax(doppler_power)
+
+        if bool(jax_jit):
+            _process_frame_jax = jax.jit(_process_frame_jax)
+
+        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, int]:
+            frame_batch = jnp.asarray(frame[None, ...])
+            if jax_compute_device is not None:
+                frame_batch = jax.device_put(frame_batch, jax_compute_device)
+            rda_jax, speed_idx_jax = _process_frame_jax(frame_batch)
+            rda = np.asarray(rda_jax)
+            speed_idx = int(np.asarray(speed_idx_jax))
+            return rda, speed_idx
 
     h5_path = _resolve_h5_path(h5_file)
     out_path = _open_output(out_file, h5_path)
@@ -241,10 +315,7 @@ def cli_main(
         stored = 0
         stride = max(1, int(sample_every))
         first_rda_shape: tuple[int, int, int] | None = None
-        total_frames = _count_frames_from_packets_h5(h5_path, raw_shape)
-        target_frames = (total_frames + stride - 1) // stride
-        if max_frames is not None:
-            target_frames = min(target_frames, int(max_frames))
+        target_frames = int(max_frames) if max_frames is not None else None
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -258,13 +329,15 @@ def cli_main(
                 if i % stride != 0:
                     continue
 
-                dear = np.abs(rsp_inst(frame[None, ...]))[0]
-                rda = np.transpose(np.mean(dear, axis=1), (2, 0, 1)).astype(np.float16)
+                rda, speed_idx = process_frame(frame)
                 if first_rda_shape is None:
-                    first_rda_shape = tuple(int(v) for v in rda.shape)
+                    first_rda_shape = (
+                        int(rda.shape[0]),
+                        int(rda.shape[1]),
+                        int(rda.shape[2]),
+                    )
                 doppler_axis = make_doppler_axis_mps(cfg["radar"], rda.shape[1], num_tx)
-                doppler_power = np.mean(rda.astype(np.float32), axis=(0, 2))
-                speeds.append(float(doppler_axis[int(np.argmax(doppler_power))]))
+                speeds.append(float(doppler_axis[speed_idx]))
 
                 if rad_ds is None:
                     rad_ds = fout.create_dataset(
@@ -281,7 +354,7 @@ def cli_main(
                 stored += 1
                 progress.advance(task_id, 1)
 
-                if stored >= target_frames:
+                if target_frames is not None and stored >= target_frames:
                     break
 
         fout.create_dataset("speed", data=np.asarray(speeds, dtype=np.float32))
@@ -307,7 +380,10 @@ def cli_main(
         "name": rsp,
         "window": bool(apply_window),
         "size": {"azimuth": int(max(1, int(azimuth_bins)))},
+        "backend": backend_name,
     }
+    if backend_name == "jax":
+        radar_meta["rsp"]["jax"] = {"device": jax_device, "jit": bool(jax_jit)}
     radar_meta["input_h5"] = str(h5_path)
     radar_meta["processed_frames"] = int(len(timestamps))
     radar_meta["rda_dimensions"] = [int(len(timestamps)), *[int(v) for v in first_rda_shape]]
@@ -315,6 +391,7 @@ def cli_main(
         json.dump(radar_meta, f, indent=4)
 
     print(f"H5 input: {h5_path}")
+    print(f"RSP backend: {backend_name}")
     print(f"Output file: {out_path}")
     print(f"Sensor file: {sensor_path}")
     print(f"Radar metadata file: {radar_json_path}")
