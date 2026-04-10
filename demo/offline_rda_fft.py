@@ -194,6 +194,35 @@ def make_range_axis_m(cfg_radar: dict, n_range: int) -> np.ndarray:
     return (C0 * fs / (2.0 * slope * n_range)) * k
 
 
+def _estimate_speed_value(
+    rda: np.ndarray,
+    doppler_axis: np.ndarray,
+    mode: str,
+    percentile: float,
+    min_count: int,
+) -> float:
+    speed_mode = mode.strip().lower()
+    if speed_mode not in {"scalar", "signed"}:
+        raise ValueError(f"Unsupported speed mode: {mode}. Choose one of: scalar, signed")
+
+    rda_fp32 = rda.astype(np.float32, copy=False)
+    threshold = np.percentile(rda_fp32, float(percentile), axis=(0, 1), keepdims=True)
+    valid = np.sum(rda_fp32 > threshold, axis=(0, 2)) > int(max(0, min_count))
+
+    if np.any(valid):
+        valid_idx = np.flatnonzero(valid)
+        farthest_idx = int(np.argmax(np.abs(doppler_axis[valid_idx])))
+        speed_idx = int(valid_idx[farthest_idx])
+    else:
+        doppler_power = np.mean(rda_fp32, axis=(0, 2))
+        speed_idx = int(np.argmax(doppler_power))
+
+    speed_signed = float(doppler_axis[speed_idx])
+    if speed_mode == "signed":
+        return speed_signed
+    return float(abs(speed_signed))
+
+
 def _make_sensor_intrinsics(
     cfg_radar: dict, rda_shape: tuple[int, int, int], num_tx: int
 ) -> dict[str, str | list[float | int]]:
@@ -225,6 +254,9 @@ def cli_main(
     backend: str = "numpy",
     jax_device: str = "auto",
     jax_jit: bool = True,
+    speed_mode: str = "scalar",
+    speed_percentile: float = 99.75,
+    speed_min_count: int = 10,
 ) -> None:
     if config is None:
         config = os.path.join(os.path.dirname(__file__), "config_awr1843l.yaml")
@@ -259,7 +291,7 @@ def cli_main(
     num_tx = _infer_num_tx(rsp_inst, default=radar_cfg.num_tx)
 
     if backend_name == "numpy":
-        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, int]:
+        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             frame_batch: np.ndarray = frame[None, ...]
             if rsp_inst.SAMPLE_TYPE == "IQ":
                 frame_for_rsp = iq_from_iiqq(frame_batch).astype(np.complex64, copy=False)
@@ -268,10 +300,9 @@ def cli_main(
 
             rd = rsp_inst.doppler_range(frame_for_rsp)
             dear = np.abs(rsp_inst.elevation_azimuth(rd))[0]
-            rda = np.transpose(np.mean(dear, axis=1), (2, 0, 1)).astype(np.float16)
-            doppler_power = np.mean(rda.astype(np.float32), axis=(0, 2))
-            speed_idx = int(np.argmax(doppler_power))
-            return rda, speed_idx
+            rda_fp32 = np.transpose(np.mean(dear, axis=1), (2, 0, 1)).astype(np.float32, copy=False)
+            rda = np.minimum(rda_fp32, np.float32(65504.0)).astype(np.float16)
+            return rda, rda_fp32
     else:
         assert jax is not None
         assert jnp is not None
@@ -285,20 +316,20 @@ def cli_main(
             rd = rsp_inst.doppler_range(frame_for_rsp)
             dear = jnp.abs(rsp_inst.elevation_azimuth(rd))[0]
             rda_fp32 = jnp.transpose(jnp.mean(dear, axis=1), (2, 0, 1))
-            doppler_power = jnp.mean(rda_fp32, axis=(0, 2))
-            return rda_fp32.astype(jnp.float16), jnp.argmax(doppler_power)
+            rda_fp16 = jnp.minimum(rda_fp32, jnp.float32(65504.0)).astype(jnp.float16)
+            return rda_fp16, rda_fp32
 
         if bool(jax_jit):
             _process_frame_jax = jax.jit(_process_frame_jax)
 
-        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, int]:
+        def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             frame_batch = jnp.asarray(frame[None, ...])
             if jax_compute_device is not None:
                 frame_batch = jax.device_put(frame_batch, jax_compute_device)
-            rda_jax, speed_idx_jax = _process_frame_jax(frame_batch)
+            rda_jax, rda_fp32_jax = _process_frame_jax(frame_batch)
             rda = np.asarray(rda_jax)
-            speed_idx = int(np.asarray(speed_idx_jax))
-            return rda, speed_idx
+            rda_fp32 = np.asarray(rda_fp32_jax)
+            return rda, rda_fp32
 
     h5_path = _resolve_h5_path(h5_file)
     out_path = _open_output(out_file, h5_path)
@@ -315,6 +346,7 @@ def cli_main(
         stored = 0
         stride = max(1, int(sample_every))
         first_rda_shape: tuple[int, int, int] | None = None
+        doppler_axis: np.ndarray | None = None
         target_frames = int(max_frames) if max_frames is not None else None
 
         with Progress(
@@ -329,15 +361,24 @@ def cli_main(
                 if i % stride != 0:
                     continue
 
-                rda, speed_idx = process_frame(frame)
+                rda, rda_for_speed = process_frame(frame)
                 if first_rda_shape is None:
                     first_rda_shape = (
                         int(rda.shape[0]),
                         int(rda.shape[1]),
                         int(rda.shape[2]),
                     )
-                doppler_axis = make_doppler_axis_mps(cfg["radar"], rda.shape[1], num_tx)
-                speeds.append(float(doppler_axis[speed_idx]))
+                if doppler_axis is None or int(doppler_axis.shape[0]) != int(rda.shape[1]):
+                    doppler_axis = make_doppler_axis_mps(cfg["radar"], rda.shape[1], num_tx)
+                speeds.append(
+                    _estimate_speed_value(
+                        rda=rda_for_speed,
+                        doppler_axis=doppler_axis,
+                        mode=speed_mode,
+                        percentile=float(speed_percentile),
+                        min_count=int(speed_min_count),
+                    )
+                )
 
                 if rad_ds is None:
                     rad_ds = fout.create_dataset(
@@ -381,6 +422,11 @@ def cli_main(
         "window": bool(apply_window),
         "size": {"azimuth": int(max(1, int(azimuth_bins)))},
         "backend": backend_name,
+    }
+    radar_meta["speed"] = {
+        "mode": speed_mode,
+        "percentile": float(speed_percentile),
+        "min_count": int(speed_min_count),
     }
     if backend_name == "jax":
         radar_meta["rsp"]["jax"] = {"device": jax_device, "jit": bool(jax_jit)}
