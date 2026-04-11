@@ -223,6 +223,11 @@ def _estimate_speed_value(
     return float(abs(speed_signed))
 
 
+def _normalize_scale(scale: float) -> float:
+    v = float(scale)
+    return v if v > 0.0 else 1.0
+
+
 def _make_sensor_intrinsics(
     cfg_radar: dict, rda_shape: tuple[int, int, int], num_tx: int
 ) -> dict[str, str | list[float | int]]:
@@ -257,6 +262,7 @@ def cli_main(
     speed_mode: str = "scalar",
     speed_percentile: float = 99.75,
     speed_min_count: int = 10,
+    rda_scale: float = 1e6,
 ) -> None:
     if config is None:
         config = os.path.join(os.path.dirname(__file__), "config_awr1843l.yaml")
@@ -289,6 +295,7 @@ def cli_main(
         window=bool(apply_window), size={"azimuth": max(1, int(azimuth_bins))}
     )
     num_tx = _infer_num_tx(rsp_inst, default=radar_cfg.num_tx)
+    rda_scale_value = _normalize_scale(rda_scale)
 
     if backend_name == "numpy":
         def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -301,7 +308,8 @@ def cli_main(
             rd = rsp_inst.doppler_range(frame_for_rsp)
             dear = np.abs(rsp_inst.elevation_azimuth(rd))[0]
             rda_fp32 = np.transpose(np.mean(dear, axis=1), (2, 0, 1)).astype(np.float32, copy=False)
-            rda = np.minimum(rda_fp32, np.float32(65504.0)).astype(np.float16)
+            rda_scaled = rda_fp32 / np.float32(rda_scale_value)
+            rda = np.minimum(rda_scaled, np.float32(65504.0)).astype(np.float16)
             return rda, rda_fp32
     else:
         assert jax is not None
@@ -316,7 +324,8 @@ def cli_main(
             rd = rsp_inst.doppler_range(frame_for_rsp)
             dear = jnp.abs(rsp_inst.elevation_azimuth(rd))[0]
             rda_fp32 = jnp.transpose(jnp.mean(dear, axis=1), (2, 0, 1))
-            rda_fp16 = jnp.minimum(rda_fp32, jnp.float32(65504.0)).astype(jnp.float16)
+            rda_scaled = rda_fp32 / jnp.float32(rda_scale_value)
+            rda_fp16 = jnp.minimum(rda_scaled, jnp.float32(65504.0)).astype(jnp.float16)
             return rda_fp16, rda_fp32
 
         if bool(jax_jit):
@@ -428,6 +437,7 @@ def cli_main(
         "percentile": float(speed_percentile),
         "min_count": int(speed_min_count),
     }
+    radar_meta["rda_scale"] = float(rda_scale_value)
     if backend_name == "jax":
         radar_meta["rsp"]["jax"] = {"device": jax_device, "jit": bool(jax_jit)}
     radar_meta["input_h5"] = str(h5_path)
@@ -438,6 +448,7 @@ def cli_main(
 
     print(f"H5 input: {h5_path}")
     print(f"RSP backend: {backend_name}")
+    print(f"RDA scale: {rda_scale_value}")
     print(f"Output file: {out_path}")
     print(f"Sensor file: {sensor_path}")
     print(f"Radar metadata file: {radar_json_path}")
