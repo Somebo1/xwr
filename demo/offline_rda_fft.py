@@ -489,11 +489,12 @@ def cli_main(
 
                 rda_raw = process_frame(frame)
                 if range_min > 0:
-                    if range_min >= int(rda_raw.shape[0]):
+                    if range_min > int(rda_raw.shape[0]):
                         raise ValueError(
-                            f"range_min_bins={range_min} is >= range bins ({int(rda_raw.shape[0])})."
+                            f"range_min_bins={range_min} is > range bins ({int(rda_raw.shape[0])})."
                         )
-                    rda_raw = rda_raw[range_min:, :, :]
+                    rda_raw = rda_raw.copy()
+                    rda_raw[:range_min, :, :] = 0.0
                 if doppler_axis is None or int(doppler_axis.shape[0]) != int(rda_raw.shape[1]):
                     doppler_axis = make_doppler_axis_mps(cfg["radar"], rda_raw.shape[1], num_tx)
                 speeds.append(
