@@ -342,6 +342,7 @@ def cli_main(
     static_clutter_bins: int = 1,
     static_clutter_percentile: float = 50.0,
     static_clutter_batch_frames: int = 256,
+    range_min_bins: int = 12,
 ) -> None:
     if config is None:
         config = os.path.join(os.path.dirname(__file__), "config_awr1843l.yaml")
@@ -377,6 +378,7 @@ def cli_main(
     rda_scale_value = _normalize_scale(rda_scale)
     clutter_percentile = float(static_clutter_percentile)
     clutter_batch_frames = max(1, int(static_clutter_batch_frames))
+    range_min = max(0, int(range_min_bins))
     if clutter_percentile < 0.0 or clutter_percentile > 100.0:
         raise ValueError("static_clutter_percentile must be in [0, 100].")
     if int(static_clutter_bins) != 1:
@@ -486,6 +488,12 @@ def cli_main(
                     continue
 
                 rda_raw = process_frame(frame)
+                if range_min > 0:
+                    if range_min >= int(rda_raw.shape[0]):
+                        raise ValueError(
+                            f"range_min_bins={range_min} is >= range bins ({int(rda_raw.shape[0])})."
+                        )
+                    rda_raw = rda_raw[range_min:, :, :]
                 if doppler_axis is None or int(doppler_axis.shape[0]) != int(rda_raw.shape[1]):
                     doppler_axis = make_doppler_axis_mps(cfg["radar"], rda_raw.shape[1], num_tx)
                 speeds.append(
@@ -548,6 +556,7 @@ def cli_main(
         "batch_frames": int(clutter_batch_frames),
         "mode": "rover_like_remove_artifact",
     }
+    radar_meta["range_min_bins"] = int(range_min)
     radar_meta["rda_scale"] = float(rda_scale_value)
     if backend_name == "jax":
         radar_meta["rsp"]["jax"] = {"device": jax_device, "jit": bool(jax_jit)}
