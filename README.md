@@ -141,3 +141,9 @@ Run with explicit config:
 uv run demo/collect.py --config demo/config_awr1843l.yaml
 uv run demo/demo_units.py --config demo/config_awr1843l.yaml
 ```
+
+Process the raw radar data files and output rda
+
+```sh
+uv run  demo/offline_rda_fft.py   --config demo/config_awr1843l.yaml   --h5-file data/20260529/bigcar/radar/2026.05.29-09.49.50.h5   --rsp AWR1642Boost   --out-file data/20260529/bigcar/radar/radar.h5
+```
